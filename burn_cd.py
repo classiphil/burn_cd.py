@@ -49,7 +49,9 @@ Examples:
     ./burn_cd.py /path/to/album --language fr
 """
 import argparse
+import contextlib
 import re
+import shutil
 import subprocess
 import sys
 import unicodedata
@@ -262,21 +264,8 @@ def validate_toc(toc_path: Path):
 
 
 def show_toc_preview(toc_path: Path):
-    """Print the .toc header through the end of the first TRACK block, so the
-    user has something concrete to look at before confirming the burn."""
-    lines = toc_path.read_text(encoding="utf-8").splitlines()
-    try:
-        track_start = next(i for i, l in enumerate(lines) if l.startswith("TRACK AUDIO"))
-    except StopIteration:
-        track_start = len(lines)
-    end = len(lines)
-    for i in range(track_start + 1, len(lines)):
-        if lines[i] == "":
-            end = i + 1
-            break
-    preview = lines[:end]
-    print(f"--- {toc_path} (first track) ---")
-    print("\n".join(preview))
+    print(f"--- {toc_path} ---")
+    print(toc_path.read_text(encoding="utf-8").rstrip())
     print("---")
 
 
@@ -294,9 +283,32 @@ def confirm_burn() -> bool:
     return reply in ("y", "yes")
 
 
+@contextlib.contextmanager
+def shutdown_inhibitor():
+    """Hold a systemd shutdown/sleep inhibitor for the duration of the block.
+    Gracefully skips if systemd-inhibit isn't available (non-systemd systems)."""
+    if not shutil.which("systemd-inhibit"):
+        print("note: systemd-inhibit nicht gefunden – kein Shutdown-Schutz aktiv", file=sys.stderr)
+        yield
+        return
+    proc = subprocess.Popen(
+        ["systemd-inhibit", "--what=shutdown:sleep", "--who=burn_cd.py",
+         "--why=CD-Brennvorgang läuft – bitte nicht herunterfahren",
+         "--mode=block", "sleep", "infinity"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    print("shutdown-Sperre aktiv (systemd-inhibit) – Herunterfahren wird bis zum Ende blockiert")
+    try:
+        yield
+    finally:
+        proc.terminate()
+        proc.wait()
+        print("shutdown-Sperre freigegeben")
+
+
 def burn(toc_path: Path, device: str, driver: str, speed: int):
     cmd = ["cdrdao", "write", "--device", device, "--driver", driver,
-           "--speed", str(speed), "-n", "-v", "2", str(toc_path)]
+           "--speed", str(speed), "-n", "-v", "2", "--force", str(toc_path)]
     print("+", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
@@ -317,14 +329,27 @@ def verify_track(folder: Path, tracks, device: str, track_no: int):
         src = src_wav.read_bytes()[44:]
         rip = ripped.read_bytes()[44:]
 
-        needle = src[1000:1100]
-        idx = rip.find(needle)
-        if idx < 0:
+        # Anchor in the middle of the track (avoids edge silence) and search
+        # within ±24000 bytes (≈ ±10 CD frames, well beyond any real drive
+        # offset) to prevent false matches from repetitive/ambient content.
+        NEEDLE_LEN = 4096
+        MAX_OFFSET = 24000
+        anchor = max(NEEDLE_LEN, len(src) // 2)
+        needle = src[anchor:anchor + NEEDLE_LEN]
+        win_start = max(0, anchor - MAX_OFFSET)
+        win_end = min(len(rip), anchor + MAX_OFFSET + NEEDLE_LEN)
+        local_idx = rip[win_start:win_end].find(needle)
+        if local_idx < 0:
             sys.exit(f"verify: could not find a matching offset between source and ripped audio for track {track_no}")
-        shift = idx - 1000
+        shift = (win_start + local_idx) - anchor
 
-        a = src[:-shift] if shift > 0 else src
-        b = rip[shift:] if shift > 0 else rip[-shift:]
+        s = abs(shift)
+        if shift > 0:
+            a, b = src[:-s], rip[s:]
+        elif shift < 0:
+            a, b = src[s:], rip[:-s]
+        else:
+            a, b = src, rip
         n = min(len(a), len(b))
         diffs = sum(1 for i in range(n) if a[i] != b[i])
 
@@ -418,16 +443,17 @@ def main():
     if not confirm_burn():
         sys.exit("burn cancelled")
 
-    burn(toc_path, args.device, args.driver, args.speed)
+    with shutdown_inhibitor():
+        burn(toc_path, args.device, args.driver, args.speed)
 
-    if args.verify:
-        verify_track2_or_1(folder, tracks, args.device)
+        if args.verify:
+            verify_track2_or_1(folder, tracks, args.device)
 
-    if args.verify2:
-        verify_first_last(folder, tracks, args.device)
+        if args.verify2:
+            verify_first_last(folder, tracks, args.device)
 
-    if args.eject:
-        eject_disc(args.device)
+        if args.eject:
+            eject_disc(args.device)
 
 
 if __name__ == "__main__":
