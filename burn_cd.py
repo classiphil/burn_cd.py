@@ -30,6 +30,8 @@ Options:
     --force-convert       re-run sox conversion even if a matching .wav already exists
     --disc-minutes MIN    target disc capacity in minutes, e.g. 74
                           (default: read from the inserted blank, falling back to 80)
+    --overburn            write past the disc's rated capacity (also offered
+                          interactively when the tracks don't fit)
     --dry-run             generate + validate the .toc, don't burn
     --verify              after burning, rip track 2 (or track 1 if there's only one
                           track) back and diff against source .wav - track 2 is used
@@ -240,16 +242,23 @@ def read_disc_capacity_minutes(device: str):
     return None
 
 
-def check_disc_capacity(tracks, disc_minutes: float):
+def check_disc_capacity(tracks, disc_minutes: float) -> bool:
     """Bail out before converting/burning if the tracks won't fit the target
-    disc size. cdrdao would otherwise fail mid-burn (or silently truncate)."""
+    disc size. cdrdao would otherwise fail mid-burn (or silently truncate).
+    Returns True if the user confirmed burning past capacity, in which case
+    cdrdao must be invoked with --overburn or it will just refuse to start."""
     capacity_sec = disc_minutes * 60
     runtime_sec = total_runtime_seconds(tracks)
     print(f"total runtime: {runtime_sec / 60:.1f} min (disc capacity: {disc_minutes:.1f} min)")
     if runtime_sec > capacity_sec:
-        sys.exit(f"total runtime {runtime_sec / 60:.1f} min exceeds the {disc_minutes:.1f} min "
-                  f"disc capacity by {(runtime_sec - capacity_sec) / 60:.1f} min - "
-                  f"use --disc-minutes to match your media if it's not a standard 80 min disc")
+        print(f"WARNING: total runtime {runtime_sec / 60:.1f} min exceeds the {disc_minutes:.1f} min "
+              f"disc capacity by {(runtime_sec - capacity_sec) / 60:.1f} min - "
+              f"use --disc-minutes to match your media if it's not a standard 80 min disc",
+              file=sys.stderr)
+        if not confirm_burn("Try to overburn anyway?"):
+            sys.exit("aborted: tracks do not fit the disc")
+        return True
+    return False
 
 
 def validate_toc(toc_path: Path):
@@ -269,12 +278,12 @@ def show_toc_preview(toc_path: Path):
     print("---")
 
 
-def confirm_burn() -> bool:
+def confirm_burn(question: str = "Start burning now?") -> bool:
     """Read the confirmation straight from the controlling terminal rather
     than stdin - under sudo, stdin can have a stray leftover newline from
     the password prompt that input() would otherwise consume immediately,
     cancelling the burn before the user can type anything."""
-    print("Start burning now? [y/N] ", end="", flush=True)
+    print(f"{question} [y/N] ", end="", flush=True)
     try:
         with open("/dev/tty") as tty:
             reply = tty.readline().strip().lower()
@@ -288,27 +297,30 @@ def shutdown_inhibitor():
     """Hold a systemd shutdown/sleep inhibitor for the duration of the block.
     Gracefully skips if systemd-inhibit isn't available (non-systemd systems)."""
     if not shutil.which("systemd-inhibit"):
-        print("note: systemd-inhibit nicht gefunden – kein Shutdown-Schutz aktiv", file=sys.stderr)
+        print("note: systemd-inhibit not found - shutdown protection disabled", file=sys.stderr)
         yield
         return
     proc = subprocess.Popen(
         ["systemd-inhibit", "--what=shutdown:sleep", "--who=burn_cd.py",
-         "--why=CD-Brennvorgang läuft – bitte nicht herunterfahren",
+         "--why=Burning a CD - do not shut down until it finishes",
          "--mode=block", "sleep", "infinity"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    print("shutdown-Sperre aktiv (systemd-inhibit) – Herunterfahren wird bis zum Ende blockiert")
+    print("shutdown inhibitor active (systemd-inhibit) - shutdown blocked until the burn completes")
     try:
         yield
     finally:
         proc.terminate()
         proc.wait()
-        print("shutdown-Sperre freigegeben")
+        print("shutdown inhibitor released")
 
 
-def burn(toc_path: Path, device: str, driver: str, speed: int):
+def burn(toc_path: Path, device: str, driver: str, speed: int, overburn: bool = False):
     cmd = ["cdrdao", "write", "--device", device, "--driver", driver,
-           "--speed", str(speed), "-n", "-v", "2", "--force", str(toc_path)]
+           "--speed", str(speed), "-n", "-v", "2", "--force"]
+    if overburn:
+        cmd.append("--overburn")
+    cmd.append(str(toc_path))
     print("+", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
@@ -397,6 +409,9 @@ def main():
     ap.add_argument("--disc-minutes", type=int, default=None,
                      help="target disc capacity in minutes, e.g. 74 for older media "
                           "(default: read from the inserted blank, falling back to 80)")
+    ap.add_argument("--overburn", action="store_true",
+                     help="pass --overburn to cdrdao so it writes past the disc's rated "
+                          "capacity (implied by confirming the over-capacity prompt)")
     ap.add_argument("--dry-run", action="store_true", help="generate + validate the .toc, don't burn")
     ap.add_argument("--verify", action="store_true",
                      help="after burning, rip track 2 (or track 1 if there's only one track) "
@@ -426,7 +441,7 @@ def main():
         else:
             print(f"detected disc capacity: {disc_minutes:.1f} min")
 
-    check_disc_capacity(tracks, disc_minutes)
+    overburn = check_disc_capacity(tracks, disc_minutes) or args.overburn
 
     toc_path = args.toc_out or (folder / "album.toc")
     toc_path.write_text(build_toc(tracks, args.no_cdtext, args.language), encoding="utf-8")
@@ -444,7 +459,7 @@ def main():
         sys.exit("burn cancelled")
 
     with shutdown_inhibitor():
-        burn(toc_path, args.device, args.driver, args.speed)
+        burn(toc_path, args.device, args.driver, args.speed, overburn=overburn)
 
         if args.verify:
             verify_track2_or_1(folder, tracks, args.device)
